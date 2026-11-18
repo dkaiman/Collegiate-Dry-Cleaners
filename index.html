@@ -14,6 +14,7 @@ header{display:flex;justify-content:space-between;align-items:center;padding:16p
 .logo{font-size:1.35rem;font-weight:bold}.logo span{color:var(--tan)}
 .btn{background:var(--green);color:#fff;border:0;border-radius:8px;padding:12px 22px;font-size:1rem;cursor:pointer;text-decoration:none;display:inline-block}
 .btn:hover{opacity:.9}
+.btn:disabled{opacity:.55;cursor:wait}
 .hero{padding:72px 5vw 56px;max-width:900px}
 .hero h1{font-size:clamp(2.2rem,6vw,3.6rem);margin:0 0 12px;line-height:1.1}
 .hero p{font-size:1.15rem;color:var(--muted);max-width:560px}
@@ -133,8 +134,9 @@ h3{margin:0 0 10px}
         <div><span>Rush fee</span><span id="sRush">$0</span></div>
         <div class="total"><span>Total</span><span id="sTotal">$0</span></div>
       </div>
-      <button class="btn" id="submit" style="width:100%;margin-top:14px">Confirm order</button>
-      <div class="msg" id="formMsg"></div>
+      <button class="btn" id="submit" style="width:100%;margin-top:14px">Continue to secure payment</button>
+      <p class="msg">Pay securely on Square. Your order is not paid until payment is verified.</p>
+      <div class="msg" id="formMsg" role="status" aria-live="polite"></div>
     </div>
   </div>
 </section>
@@ -146,9 +148,9 @@ h3{margin:0 0 10px}
 const RUSH_FEE = 10;          // flat rush fee in dollars (return in 3–4 days)
 const MIN_DAYS = 3;           // earliest allowed return = pickup + 3 days (nothing within 2 days)
 const STANDARD_DAYS = 5;      // 5+ days = no rush fee
-// To auto-fill a spreadsheet: deploy a Google Apps Script web app (or Zapier/Formspree/Make webhook)
-// and paste its URL here. Orders are POSTed as JSON. Leave "" to download a CSV instead.
-const ORDER_ENDPOINT = "";
+// After deploying backend/worker.mjs, paste its HTTPS base URL here (no trailing slash).
+// Never put a Square access token in this public file.
+const SQUARE_WORKER_URL = "";
 /* ================================ */
 
 const ITEMS = [
@@ -222,7 +224,9 @@ $("clear").onclick=()=>{pickup="";dropoff="";renderCal();update();};
 $("cal").addEventListener("click",e=>{
   const b=e.target.closest(".day"); if(!b||b.disabled) return;
   const ds=b.dataset.d;
-  if(!pickup || ds<=pickup){ pickup=ds; dropoff=""; }   // choosing (or re-choosing) pickup
+  if(ds===pickup){ pickup=""; dropoff=""; }             // click selected pickup again: clear both
+  else if(ds===dropoff){ dropoff=""; }                  // click selected return again: clear return only
+  else if(!pickup || ds<pickup){ pickup=ds; dropoff=""; } // choosing (or re-choosing) pickup
   else { dropoff=ds; }                                  // choosing return date
   renderCal(); update();
 });
@@ -271,24 +275,55 @@ $("submit").addEventListener("click",async()=>{
     total:sub+(rushApplies()?RUSH_FEE:0)
   };
 
-  if(ORDER_ENDPOINT){
-    try{
-      await fetch(ORDER_ENDPOINT,{method:"POST",mode:"no-cors",headers:{"Content-Type":"text/plain"},body:JSON.stringify(order)});
-    }catch(e){ return f.textContent="Something went wrong sending your order. Please try again."; }
-  } else {
-    // Fallback: download a CSV row so orders can be opened in Excel
-    const cols=Object.keys(order);
-    const csv=cols.join(",")+"\n"+cols.map(c=>'"'+String(order[c]).replace(/"/g,'""')+'"').join(",");
-    const a=document.createElement("a");
-    a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
-    a.download="collegiate-order.csv"; a.click();
+  if(!SQUARE_WORKER_URL){
+    f.textContent="Online payment is not set up yet. No order has been placed or payment taken.";
+    return;
   }
-  f.className="msg ok";
-  f.textContent="Order confirmed! We'll pick up on "+nice(order.pickup_date)+" ("+order.pickup_window+") and deliver on "+nice(order.dropoff_date)+". Total: "+money(order.total)+".";
+  const button=$("submit"); button.disabled=true;
+  f.className="msg"; f.textContent="Opening secure Square checkout…";
+  const payload={customer:{name:order.name,email:order.email,phone:order.phone,address:order.address},
+    pickup_date:pickup,pickup_window:order.pickup_window,dropoff_date:dropoff,
+    items:ITEMS.map((it,i)=>({name:it.name,quantity:qty[i]})).filter(x=>x.quantity>0)};
+  try{
+    const fingerprint=JSON.stringify(payload);
+    let pending=JSON.parse(sessionStorage.getItem("collegiateCheckout")||"null");
+    if(!pending || pending.fingerprint!==fingerprint){
+      pending={id:crypto.randomUUID(),fingerprint};
+      sessionStorage.setItem("collegiateCheckout",JSON.stringify(pending));
+    }
+    const r=await fetch(SQUARE_WORKER_URL.replace(/\/$/,"")+"/checkout",{
+      method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({...payload,request_id:pending.id}),signal:AbortSignal.timeout(25000)});
+    const data=await r.json();
+    if(!r.ok) throw new Error(data.error||"Checkout is temporarily unavailable. Please try again.");
+    const url=new URL(data.url);
+    if(url.protocol!=="https:" || !["square.link","squareup.com","squareupsandbox.com"].some(h=>url.hostname===h||url.hostname.endsWith("."+h))) throw new Error("Unexpected checkout address.");
+    window.location.assign(url.href);
+  }catch(e){
+    f.className="msg err";
+    f.textContent=e.name==="TimeoutError"?"Checkout is taking longer than expected. Try again to resume the same checkout.":(e.message||"Couldn't open checkout. Please try again.");
+    button.disabled=false;
+  }
 });
+
+async function checkPayment(){
+  const token=new URL(location.href).searchParams.get("checkout");
+  if(!token || !SQUARE_WORKER_URL) return;
+  const f=$("formMsg"); f.scrollIntoView({block:"center"});
+  f.textContent="Checking your payment with Square…";
+  try{
+    const r=await fetch(SQUARE_WORKER_URL.replace(/\/$/,"")+"/status?token="+encodeURIComponent(token),{signal:AbortSignal.timeout(20000)});
+    const data=await r.json();
+    if(!r.ok) throw new Error("Could not verify payment right now. Check your Square receipt before paying again.");
+    f.className=data.paid?"msg ok":"msg";
+    f.textContent=data.paid?"Payment verified. Your pickup request has been recorded. Order reference: "+data.reference:
+      "Payment has not been verified yet. If you paid, check your Square receipt and refresh this page. Do not pay again.";
+    if(data.paid) sessionStorage.removeItem("collegiateCheckout");
+  }catch(e){f.className="msg err"; f.textContent=e.message;}
+}
+checkPayment();
 
 renderCal(); update();
 </script>
 </body>
 </html>
-
